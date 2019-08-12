@@ -46,6 +46,8 @@ struct block_cache_conf {
     u_int               read_ahead;
     u_int               read_ahead_trigger;
     u_int               no_verify;
+    u_int               recover_dirty_blocks;
+    u_int               perform_flush;
     const char          *cache_file;
     log_func_t          *log;
 };
@@ -67,4 +69,5 @@ struct block_cache_stats {
 /* block_cache.c */
 extern struct s3backer_store *block_cache_create(struct block_cache_conf *config, struct s3backer_store *inner);
 extern void block_cache_get_stats(struct s3backer_store *s3b, struct block_cache_stats *stats);
+extern void block_cache_clear_stats(struct s3backer_store *s3b);
 

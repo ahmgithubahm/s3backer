@@ -49,8 +49,9 @@ struct test_io_private {
 };
 
 /* s3backer_store functions */
+static int test_io_create_threads(struct s3backer_store *s3b);
 static int test_io_meta_data(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep);
-static int test_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value);
+static int test_io_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int32_t new_value);
 static int test_io_read_block(struct s3backer_store *s3b, s3b_block_t block_num, void *dest,
   u_char *actual_md5, const u_char *expect_md5, int strict);
 static int test_io_write_block(struct s3backer_store *s3b, s3b_block_t block_num, const void *src, u_char *md5,
@@ -75,8 +76,9 @@ test_io_create(struct http_io_conf *config)
     /* Initialize structures */
     if ((s3b = calloc(1, sizeof(*s3b))) == NULL)
         return NULL;
+    s3b->create_threads = test_io_create_threads;
     s3b->meta_data = test_io_meta_data;
-    s3b->set_mounted = test_io_set_mounted;
+    s3b->set_mount_token = test_io_set_mount_token;
     s3b->read_block = test_io_read_block;
     s3b->write_block = test_io_write_block;
     s3b->read_block_part = test_io_read_block_part;
@@ -100,13 +102,19 @@ test_io_create(struct http_io_conf *config)
 }
 
 static int
+test_io_create_threads(struct s3backer_store *s3b)
+{
+    return 0;
+}
+
+static int
 test_io_meta_data(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep)
 {
     return 0;
 }
 
 static int
-test_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
+test_io_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int32_t new_value)
 {
     if (old_valuep != NULL)
         *old_valuep = 0;
@@ -210,11 +218,21 @@ test_io_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, void
 
     /* Check expected MD5 */
     if (expect_md5 != NULL) {
-        const int match = memcmp(md5, expect_md5, MD5_DIGEST_LENGTH);
+        const int match = memcmp(md5, expect_md5, MD5_DIGEST_LENGTH) == 0;
 
         if (strict) {
             if (!match) {
-                (*config->log)(LOG_ERR, "%s: wrong MD5 checksum?!", path);
+                (*config->log)(LOG_ERR,
+                   "%s: wrong MD5 checksum?! %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
+                   " != %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", path,
+                  (u_int)md5[0], (u_int)md5[1], (u_int)md5[2], (u_int)md5[3],
+                  (u_int)md5[4], (u_int)md5[5], (u_int)md5[6], (u_int)md5[7],
+                  (u_int)md5[8], (u_int)md5[9], (u_int)md5[10], (u_int)md5[11],
+                  (u_int)md5[12], (u_int)md5[13], (u_int)md5[14], (u_int)md5[15],
+                  (u_int)expect_md5[0], (u_int)expect_md5[1], (u_int)expect_md5[2], (u_int)expect_md5[3],
+                  (u_int)expect_md5[4], (u_int)expect_md5[5], (u_int)expect_md5[6], (u_int)expect_md5[7],
+                  (u_int)expect_md5[8], (u_int)expect_md5[9], (u_int)expect_md5[10], (u_int)expect_md5[11],
+                  (u_int)expect_md5[12], (u_int)expect_md5[13], (u_int)expect_md5[14], (u_int)expect_md5[15]);
                 return EINVAL;
             }
         } else if (match)
@@ -223,7 +241,13 @@ test_io_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, void
 
     /* Logging */
     if (config->debug) {
-        (*config->log)(LOG_DEBUG, "test_io: read %0*jx complete%s%s", S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num,
+        (*config->log)(LOG_DEBUG,
+          "test_io: read %0*jx complete, MD5 %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%s%s",
+          S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num,
+          (u_int)md5[0], (u_int)md5[1], (u_int)md5[2], (u_int)md5[3],
+          (u_int)md5[4], (u_int)md5[5], (u_int)md5[6], (u_int)md5[7],
+          (u_int)md5[8], (u_int)md5[9], (u_int)md5[10], (u_int)md5[11],
+          (u_int)md5[12], (u_int)md5[13], (u_int)md5[14], (u_int)md5[15],
           zero_block ? " (zero)" : "", r == EEXIST ? " (expected md5 match)" : "");
     }
 
@@ -237,6 +261,7 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
 {
     struct test_io_private *const priv = s3b->data;
     struct http_io_conf *const config = priv->config;
+    char block_hash_buf[S3B_BLOCK_NUM_DIGITS + 2];
     u_char md5[MD5_DIGEST_LENGTH];
     char temp[PATH_MAX];
     char path[PATH_MAX];
@@ -263,8 +288,14 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
 
     /* Logging */
     if (config->debug) {
-        (*config->log)(LOG_DEBUG, "test_io: write %0*jx started%s",
-          S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num, src == NULL ? " (zero block)" : "");
+        (*config->log)(LOG_DEBUG,
+          "test_io: write %0*jx started, MD5 %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%s",
+          S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num,
+          (u_int)md5[0], (u_int)md5[1], (u_int)md5[2], (u_int)md5[3],
+          (u_int)md5[4], (u_int)md5[5], (u_int)md5[6], (u_int)md5[7],
+          (u_int)md5[8], (u_int)md5[9], (u_int)md5[10], (u_int)md5[11],
+          (u_int)md5[12], (u_int)md5[13], (u_int)md5[14], (u_int)md5[15],
+          src == NULL ? " (zero block)" : "");
     }
 
     /* Random delay */
@@ -277,7 +308,9 @@ test_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     }
 
     /* Generate path */
-    snprintf(path, sizeof(path), "%s/%s%0*jx", config->bucket, config->prefix, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
+    http_io_format_block_hash(config, block_hash_buf, sizeof(block_hash_buf), block_num);
+    snprintf(path, sizeof(path), "%s/%s%s%0*jx",
+      config->bucket, config->prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
 
     /* Delete zero blocks */
     if (src == NULL) {

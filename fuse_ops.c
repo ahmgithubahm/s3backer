@@ -89,6 +89,7 @@ static int fuse_op_statfs(const char *path, struct statvfs *st);
 static int fuse_op_truncate(const char *path, off_t size);
 static int fuse_op_flush(const char *path, struct fuse_file_info *fi);
 static int fuse_op_fsync(const char *path, int isdatasync, struct fuse_file_info *fi);
+static int fuse_op_unlink(const char *path);
 #if FUSE_FALLOCATE
 static int fuse_op_fallocate(const char *path, int mode, off_t offset, off_t len, struct fuse_file_info *fi);
 #endif
@@ -121,6 +122,7 @@ const struct fuse_operations s3backer_fuse_ops = {
     .flush      = fuse_op_flush,
     .fsync      = fuse_op_fsync,
     .release    = fuse_op_release,
+    .unlink     = fuse_op_unlink,
 #if FUSE_FALLOCATE
     .fallocate  = fuse_op_fallocate,
 #endif
@@ -128,18 +130,33 @@ const struct fuse_operations s3backer_fuse_ops = {
 
 /* Configuration and underlying s3backer_store */
 static struct fuse_ops_conf *config;
+static struct fuse_ops_private *the_priv;
 
 /****************************************************************************
  *                      PUBLIC FUNCTION DEFINITIONS                         *
  ****************************************************************************/
 
 const struct fuse_operations *
-fuse_ops_create(struct fuse_ops_conf *config0)
+fuse_ops_create(struct fuse_ops_conf *config0, struct s3backer_store *s3b)
 {
-    if (config != NULL) {
-        (*config0->log)(LOG_ERR, "s3backer_get_fuse_ops(): duplicate invocation");
+    /* Sanity check */
+    assert(config0 != NULL);
+    assert(s3b != NULL);
+
+    /* Prevent duplicate invocation */
+    if (config != NULL || the_priv != NULL) {
+        (*config0->log)(LOG_ERR, "fuse_ops_create(): duplicate invocation");
         return NULL;
     }
+
+    /* Create private structure */
+    if ((the_priv = calloc(1, sizeof(*the_priv))) == NULL) {
+        (*config->log)(LOG_ERR, "fuse_ops_create(): %s", strerror(errno));
+        return NULL;
+    }
+    the_priv->s3b = s3b;
+
+    /* Now we're ready */
     config = config0;
     return &s3backer_fuse_ops;
 }
@@ -152,13 +169,14 @@ static void *
 fuse_op_init(struct fuse_conn_info *conn)
 {
     struct s3b_config *const s3bconf = config->s3bconf;
-    struct fuse_ops_private *priv;
+    struct fuse_ops_private *const priv = the_priv;
+    int r;
 
-    /* Create private structure */
-    if ((priv = calloc(1, sizeof(*priv))) == NULL) {
-        (*config->log)(LOG_ERR, "fuse_op_init(): %s", strerror(errno));
-        exit(1);
-    }
+    /* Sanity check */
+    assert(priv != NULL);
+    assert(priv->s3b != NULL);
+
+    /* Initialize */
     priv->block_bits = ffs(config->block_size) - 1;
     priv->start_time = time(NULL);
     priv->file_atime = priv->start_time;
@@ -166,10 +184,9 @@ fuse_op_init(struct fuse_conn_info *conn)
     priv->stats_atime = priv->start_time;
     priv->file_size = config->num_blocks * config->block_size;
 
-    /* Create backing store */
-    if ((priv->s3b = s3backer_create_store(s3bconf)) == NULL) {
-        (*config->log)(LOG_ERR, "fuse_op_init(): can't create s3backer_store: %s", strerror(errno));
-        free(priv);
+    /* Startup background threads now that we have fork()'d */
+    if ((r = (*priv->s3b->create_threads)(priv->s3b)) != 0) {
+        (*config->log)(LOG_ERR, "fuse_op_init(): can't create threads: %s", strerror(errno));
         return NULL;
     }
 
@@ -198,11 +215,11 @@ fuse_op_destroy(void *data)
             (*config->log)(LOG_ERR, "unmount %s: flushing filesystem failed: %s", s3bconf->mount, strerror(r));
     }
 
-    /* Clear mounted flag */
+    /* Clear mount token */
     if (!config->read_only) {
-        (*config->log)(LOG_INFO, "unmount %s: clearing mounted flag", s3bconf->mount);
-        if ((r = (*s3b->set_mounted)(s3b, NULL, 0)) != 0)
-            (*config->log)(LOG_ERR, "unmount %s: clearing mounted flag failed: %s", s3bconf->mount, strerror(r));
+        (*config->log)(LOG_INFO, "unmount %s: clearing mount token", s3bconf->mount);
+        if ((r = (*s3b->set_mount_token)(s3b, NULL, 0)) != 0)
+            (*config->log)(LOG_ERR, "unmount %s: clearing mount token failed: %s", s3bconf->mount, strerror(r));
     }
 
     /* Shutdown */
@@ -539,6 +556,22 @@ fuse_op_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
 {
     return 0;
 }
+
+static int
+fuse_op_unlink(const char *path)
+{
+    /* Handle stats file */
+    if (*path == '/' && strcmp(path + 1, config->stats_filename) == 0) {
+        if (config->clear_stats == NULL)
+            return -EOPNOTSUPP;
+        (*config->clear_stats)();
+        return 0;
+    }
+
+    /* Not supported */
+    return -EOPNOTSUPP;
+}
+
 
 #if FUSE_FALLOCATE
 static int

@@ -120,6 +120,25 @@ typedef int         check_cancel_t(void *arg, s3b_block_t block_num);
 struct s3backer_store {
 
     /*
+     * Create any background pthreads that may be required.
+     *
+     * This must be invoked prior to any of the following functions:
+     *
+     *      o block_read
+     *      o block_read_part
+     *      o block_write
+     *      o block_write_part
+     *
+     * It should be invoked after the initial process fork() because it may create pthreads.
+     *
+     * Returns:
+     *
+     *  0       Success
+     *  Other   Other error
+     */
+    int         (*create_threads)(struct s3backer_store *s3b);
+
+    /*
      * Get meta-data associated with the underlying store.
      *
      * The information we acquire is:
@@ -135,18 +154,19 @@ struct s3backer_store {
     int         (*meta_data)(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep);
 
     /*
-     * Read and (optionally) set the mounted flag.
+     * Read and (optionally) set the mount token. The mount token is any 32 bit integer value greater than zero.
      *
-     * Previous value is returned in *old_valuep (if not NULL).
+     * Previous value, if any, is returned in *old_valuep (if not NULL). A returned value of zero means there was
+     * no previous value.
      *
      * new_value can be:
-     *  -1      Don't change it
-     *   0      Clear it
-     *   1      Set it
+     *   < 0    Don't change anything, just read the existing value, if any
+     *   = 0    Clear the flag
+     *   > 0    Set flag to new_value
      *
      * Returns zero on success or a (positive) errno value on error.
      */
-    int         (*set_mounted)(struct s3backer_store *s3b, int *old_valuep, int new_value);
+    int         (*set_mount_token)(struct s3backer_store *s3b, int32_t *old_valuep, int32_t new_value);
 
     /*
      * Read one block. Never-written-to blocks will return all zeroes.
@@ -165,6 +185,7 @@ struct s3backer_store {
      *      - Return EEXIST; the block may or may not also be read normally into *dest
      *
      * Returns zero on success or a (positive) errno value on error.
+     * May return ENOTCONN if create_threads() has not yet been invoked.
      */
     int         (*read_block)(struct s3backer_store *s3b, s3b_block_t block_num, void *dest,
                   u_char *actual_md5, const u_char *expect_md5, int strict);
@@ -173,6 +194,7 @@ struct s3backer_store {
      * Read part of one block.
      *
      * Returns zero on success or a (positive) errno value on error.
+     * May return ENOTCONN if create_threads() has not yet been invoked.
      */
     int         (*read_block_part)(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, void *dest);
 
@@ -188,6 +210,7 @@ struct s3backer_store {
      * parameter of read_block(); if the block is all zeroes, md5 will be zeroed.
      *
      * Returns zero on success or a (positive) errno value on error.
+     * May return ENOTCONN if create_threads() has not yet been invoked.
      */
     int         (*write_block)(struct s3backer_store *s3b, s3b_block_t block_num, const void *src, u_char *md5,
                   check_cancel_t *check_cancel, void *arg);
@@ -196,6 +219,7 @@ struct s3backer_store {
      * Write part of one block.
      *
      * Returns zero on success or a (positive) errno value on error.
+     * May return ENOTCONN if create_threads() has not yet been invoked.
      */
     int         (*write_block_part)(struct s3backer_store *s3b, s3b_block_t block_num, u_int off, u_int len, const void *src);
 

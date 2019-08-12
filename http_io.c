@@ -58,9 +58,11 @@
 #define MD5_HEADER                  "Content-MD5"
 #define ACL_HEADER                  "x-amz-acl"
 #define CONTENT_SHA256_HEADER       "x-amz-content-sha256"
+#define SSE_HEADER                  "x-amz-server-side-encryption"
 #define STORAGE_CLASS_HEADER        "x-amz-storage-class"
 #define FILE_SIZE_HEADER            "x-amz-meta-s3backer-filesize"
 #define BLOCK_SIZE_HEADER           "x-amz-meta-s3backer-blocksize"
+#define MOUNT_TOKEN_HEADER          "x-amz-meta-s3backer-mount-token"
 #define HMAC_HEADER                 "x-amz-meta-s3backer-hmac"
 #define IF_MATCH_HEADER             "If-Match"
 #define IF_NONE_MATCH_HEADER        "If-None-Match"
@@ -68,11 +70,9 @@
 /* MIME type for blocks */
 #define CONTENT_TYPE                "application/x-s3backer-block"
 
-/* MIME type for mounted flag */
-#define MOUNTED_FLAG_CONTENT_TYPE   "text/plain"
-
-/* Mounted file object name */
-#define MOUNTED_FLAG                "s3backer-mounted"
+/* Mount token file */
+#define MOUNT_TOKEN_FILE            "s3backer-mounted"
+#define MOUNT_TOKEN_FILE_MIME_TYPE  "text/plain"
 
 /* HTTP `Date' and `x-amz-date' header formats */
 #define HTTP_DATE_HEADER            "Date"
@@ -82,8 +82,11 @@
 #define DATE_BUF_SIZE               64
 
 /* Size required for URL buffer */
-#define URL_BUF_SIZE(config)        (strlen((config)->baseURL) + strlen((config)->bucket) \
-                                      + strlen((config)->prefix) + S3B_BLOCK_NUM_DIGITS + 2)
+#define URL_BUF_SIZE(config)        (strlen((config)->baseURL) \
+                                      + strlen((config)->bucket) + 1 \
+                                      + strlen((config)->prefix) \
+                                      + S3B_BLOCK_NUM_DIGITS + 1 \
+                                      + S3B_BLOCK_NUM_DIGITS + 2)
 
 /* Bucket listing API constants */
 #define LIST_PARAM_MARKER           "marker"
@@ -111,6 +114,9 @@
 /* Enable to debug authentication stuff */
 #define DEBUG_AUTHENTICATION        0
 
+/* Enable to debug parsing block list response */
+#define DEBUG_BLOCK_LIST            0
+
 /* Version 4 authentication stuff */
 #define SIGNATURE_ALGORITHM         "AWS4-HMAC-SHA256"
 #define ACCESS_KEY_PREFIX           "AWS4"
@@ -123,6 +129,10 @@
 #define EC2_IAM_META_DATA_ACCESSID  "AccessKeyId"
 #define EC2_IAM_META_DATA_ACCESSKEY "SecretAccessKey"
 #define EC2_IAM_META_DATA_TOKEN     "Token"
+
+/* TCP keep-alive */
+#define TCP_KEEP_ALIVE_IDLE         200
+#define TCP_KEEP_ALIVE_INTERVAL     60
 
 /* Misc */
 #define WHITESPACE                  " \t\v\f\r\n"
@@ -189,6 +199,7 @@ struct http_io {
     const char          *method;                // HTTP method
     const char          *url;                   // HTTP URL
     struct curl_slist   *headers;               // HTTP headers
+    const char          *sse;                   // Server Side Encryption
     void                *dest;                  // Block data (when reading)
     const void          *src;                   // Block data (when writing)
     s3b_block_t         block_num;              // The block we're reading/writing
@@ -196,6 +207,7 @@ struct http_io {
     u_int               *content_lengthp;       // Returned Content-Length
     uintmax_t           file_size;              // file size from "x-amz-meta-s3backer-filesize"
     u_int               block_size;             // block size from "x-amz-meta-s3backer-blocksize"
+    int32_t             mount_token;            // mount_token from "x-amz-meta-s3backer-mount-token"
     u_int               expect_304;             // a verify request; expect a 304 response
     u_char              md5[MD5_DIGEST_LENGTH]; // parsed ETag header
     u_char              hmac[SHA_DIGEST_LENGTH];// parsed "x-amz-meta-s3backer-hmac" header
@@ -208,8 +220,9 @@ struct http_io {
 typedef void http_io_curl_prepper_t(CURL *curl, struct http_io *io);
 
 /* s3backer_store functions */
+static int http_io_create_threads(struct s3backer_store *s3b);
 static int http_io_meta_data(struct s3backer_store *s3b, off_t *file_sizep, u_int *block_sizep);
-static int http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value);
+static int http_io_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int32_t new_value);
 static int http_io_read_block(struct s3backer_store *s3b, s3b_block_t block_num, void *dest,
   u_char *actual_md5, const u_char *expect_md5, int strict);
 static int http_io_write_block(struct s3backer_store *s3b, s3b_block_t block_num, const void *src, u_char *md5,
@@ -229,7 +242,7 @@ static http_io_curl_prepper_t http_io_iamcreds_prepper;
 
 /* S3 REST API functions */
 static void http_io_get_block_url(char *buf, size_t bufsiz, struct http_io_conf *config, s3b_block_t block_num);
-static void http_io_get_mounted_flag_url(char *buf, size_t bufsiz, struct http_io_conf *config);
+static void http_io_get_mount_token_file_url(char *buf, size_t bufsiz, struct http_io_conf *config);
 static int http_io_add_auth(struct http_io_private *priv, struct http_io *io, time_t now, const void *payload, size_t plen);
 static int http_io_add_auth2(struct http_io_private *priv, struct http_io *io, time_t now, const void *payload, size_t plen);
 static int http_io_add_auth4(struct http_io_private *priv, struct http_io *io, time_t now, const void *payload, size_t plen);
@@ -252,8 +265,8 @@ static int http_io_perform_io(struct http_io_private *priv, struct http_io *io, 
 static size_t http_io_curl_reader(const void *ptr, size_t size, size_t nmemb, void *stream);
 static size_t http_io_curl_writer(void *ptr, size_t size, size_t nmemb, void *stream);
 static size_t http_io_curl_header(void *ptr, size_t size, size_t nmemb, void *stream);
-static struct curl_slist *http_io_add_header(struct curl_slist *headers, const char *fmt, ...)
-    __attribute__ ((__format__ (__printf__, 2, 3)));
+static struct curl_slist *http_io_add_header(struct http_io_private *priv, struct curl_slist *headers, const char *fmt, ...)
+    __attribute__ ((__format__ (__printf__, 3, 4)));
 static void http_io_add_date(struct http_io_private *priv, struct http_io *const io, time_t now);
 static CURL *http_io_acquire_curl(struct http_io_private *priv, struct http_io *io);
 static void http_io_release_curl(struct http_io_private *priv, CURL **curlp, int may_cache);
@@ -267,15 +280,19 @@ static void http_io_authsig(struct http_io_private *priv, s3b_block_t block_num,
 static void update_hmac_from_header(HMAC_CTX *ctx, struct http_io *io,
   const char *name, int value_only, char *sigbuf, size_t sigbuflen);
 static int http_io_is_zero_block(const void *data, u_int block_size);
+static s3b_block_t http_io_block_hash_prefix(s3b_block_t block_num);
 static int http_io_parse_hex(const char *str, u_char *buf, u_int nbytes);
+static int http_io_parse_hex_block_num(const char *string, s3b_block_t *block_nump);
 static void http_io_prhex(char *buf, const u_char *data, size_t len);
 static int http_io_strcasecmp_ptr(const void *ptr1, const void *ptr2);
+static int http_io_parse_header(const char *input, const char *header, const char *fmt, ...);
 
 /* Internal variables */
 static pthread_mutex_t *openssl_locks;
 static int num_openssl_locks;
 static u_char zero_md5[MD5_DIGEST_LENGTH];
 static u_char zero_hmac[SHA_DIGEST_LENGTH];
+static const s3b_block_t last_possible_block = (s3b_block_t)~0L;
 
 /*
  * Constructor
@@ -303,8 +320,9 @@ http_io_create(struct http_io_conf *config)
         r = errno;
         goto fail0;
     }
+    s3b->create_threads = http_io_create_threads;
     s3b->meta_data = http_io_meta_data;
-    s3b->set_mounted = http_io_set_mounted;
+    s3b->set_mount_token = http_io_set_mount_token;
     s3b->read_block = http_io_read_block;
     s3b->write_block = http_io_write_block;
     s3b->read_block_part = http_io_read_block_part;
@@ -334,6 +352,10 @@ http_io_create(struct http_io_conf *config)
     }
     CRYPTO_set_locking_callback(http_io_openssl_locker);
     CRYPTO_set_id_callback(http_io_openssl_ider);
+
+    /* Avoid GCC unused-function warnings */
+    (void)http_io_openssl_locker;
+    (void)http_io_openssl_ider;
 
     /* Initialize encryption */
     if (config->encryption != NULL) {
@@ -391,13 +413,9 @@ http_io_create(struct http_io_conf *config)
     /* Initialize cURL */
     curl_global_init(CURL_GLOBAL_ALL);
 
-    /* Initialize IAM credentials and start updater thread */
-    if (config->ec2iam_role != NULL) {
-        if ((r = update_iam_credentials(priv)) != 0)
-            goto fail5;
-        if ((r = pthread_create(&priv->iam_thread, NULL, update_iam_credentials_main, priv)) != 0)
-            goto fail5;
-    }
+    /* Initialize IAM credentials */
+    if (config->ec2iam_role != NULL && (r = update_iam_credentials(priv)) != 0)
+        goto fail5;
 
     /* Take ownership of non-zero block bitmap */
     priv->non_zero = config->nonzero_bitmap;
@@ -495,13 +513,23 @@ http_io_get_stats(struct s3backer_store *s3b, struct http_io_stats *stats)
     pthread_mutex_unlock(&priv->mutex);
 }
 
+void
+http_io_clear_stats(struct s3backer_store *s3b)
+{
+    struct http_io_private *const priv = s3b->data;
+
+    pthread_mutex_lock(&priv->mutex);
+    memset(&priv->stats, 0, sizeof(priv->stats));
+    pthread_mutex_unlock(&priv->mutex);
+}
+
 static int
 http_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, void *arg)
 {
     struct http_io_private *const priv = s3b->data;
     struct http_io_conf *const config = priv->config;
-    char marker[sizeof("&marker=") + strlen(config->prefix) + S3B_BLOCK_NUM_DIGITS + 1];
-    char urlbuf[URL_BUF_SIZE(config) + sizeof(marker) + 32];
+    char url_encoded_prefix[strlen(config->prefix) * 3 + 1];
+    char urlbuf[URL_BUF_SIZE(config) + sizeof("&marker=") + sizeof(url_encoded_prefix) + (S3B_BLOCK_NUM_DIGITS * 2) + 36];
     struct http_io io;
     int r;
 
@@ -521,7 +549,7 @@ http_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, voi
     }
 
     /* Allocate buffers for XML path and tag text content */
-    io.xml_text_max = strlen(config->prefix) + S3B_BLOCK_NUM_DIGITS + 10;
+    io.xml_text_max = strlen(config->prefix) + (S3B_BLOCK_NUM_DIGITS * 2) + 16;
     if ((io.xml_text = malloc(io.xml_text_max + 1)) == NULL) {
         (*config->log)(LOG_ERR, "malloc: %s", strerror(errno));
         goto oom;
@@ -533,7 +561,6 @@ http_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, voi
 
     /* List blocks */
     do {
-        char url_encoded_prefix[strlen(config->prefix) * 3 + 1];
         const time_t now = time(NULL);
 
         /* Reset XML parser state */
@@ -550,8 +577,11 @@ http_io_list_blocks(struct s3backer_store *s3b, block_list_func_t *callback, voi
 
         /* Add URL parameters (note: must be in "canonical query string" format for proper authentication) */
         if (io.list_truncated) {
-            snprintf(urlbuf + strlen(urlbuf), sizeof(urlbuf) - strlen(urlbuf), "%s=%s%0*jx&",
-              LIST_PARAM_MARKER, url_encoded_prefix, S3B_BLOCK_NUM_DIGITS, (uintmax_t)io.last_block);
+            char block_hash_buf[S3B_BLOCK_NUM_DIGITS + 2];
+
+            http_io_format_block_hash(config, block_hash_buf, sizeof(block_hash_buf), io.last_block);
+            snprintf(urlbuf + strlen(urlbuf), sizeof(urlbuf) - strlen(urlbuf), "%s=%s%s%0*jx&",
+              LIST_PARAM_MARKER, url_encoded_prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)io.last_block);
         }
         snprintf(urlbuf + strlen(urlbuf), sizeof(urlbuf) - strlen(urlbuf), "%s=%u", LIST_PARAM_MAX_KEYS, LIST_BLOCKS_CHUNK);
         snprintf(urlbuf + strlen(urlbuf), sizeof(urlbuf) - strlen(urlbuf), "&%s=%s", LIST_PARAM_PREFIX, url_encoded_prefix);
@@ -658,23 +688,62 @@ http_io_list_elem_start(void *arg, const XML_Char *name, const XML_Char **atts)
     /* Reset buffer */
     io->xml_text_len = 0;
     io->xml_text[0] = '\0';
+
+#if DEBUG_BLOCK_LIST
+    /* Debug */
+    (*io->config->log)(LOG_DEBUG, "list: new path: \"%s\"", io->xml_path);
+#endif
 }
 
 static void
 http_io_list_elem_end(void *arg, const XML_Char *name)
 {
     struct http_io *const io = (struct http_io *)arg;
+    struct http_io_conf *const config = io->config;
     s3b_block_t block_num;
 
     /* Handle <Truncated> tag */
-    if (strcmp(io->xml_path, "/" LIST_ELEM_LIST_BUCKET_RESLT "/" LIST_ELEM_IS_TRUNCATED) == 0)
+    if (strcmp(io->xml_path, "/" LIST_ELEM_LIST_BUCKET_RESLT "/" LIST_ELEM_IS_TRUNCATED) == 0) {
         io->list_truncated = strcmp(io->xml_text, LIST_TRUE) == 0;
+#if DEBUG_BLOCK_LIST
+        (*config->log)(LOG_DEBUG, "list: parsed truncated=%d", io->list_truncated);
+#endif
+    }
 
     /* Handle <Key> tag */
     else if (strcmp(io->xml_path, "/" LIST_ELEM_LIST_BUCKET_RESLT "/" LIST_ELEM_CONTENTS "/" LIST_ELEM_KEY) == 0) {
-        if (http_io_parse_block(io->config, io->xml_text, &block_num) == 0) {
+#if DEBUG_BLOCK_LIST
+        (*config->log)(LOG_DEBUG, "list: key=\"%s\"", io->xml_text);
+#endif
+
+        /* Attempt to parse key as a block's object name */
+        if (http_io_parse_block(config, io->xml_text, &block_num) == 0) {
+#if DEBUG_BLOCK_LIST
+            (*config->log)(LOG_DEBUG, "list: parsed key=\"%s\" -> block=%0*jx",
+              io->xml_text, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
+#endif
             (*io->callback_func)(io->callback_arg, block_num);
             io->last_block = block_num;
+        } else {                                                        /* object is some unrelated junk that we can ignore */
+            char last_block_path[strlen(config->prefix) + S3B_BLOCK_NUM_DIGITS + 1];
+
+#if DEBUG_BLOCK_LIST
+            (*config->log)(LOG_DEBUG, "list: can't parse key=\"%s\"", io->xml_text);
+#endif
+
+            /*
+             * If the object name is lexicographically after our last possible block name, we are done.
+             * Note that this works whether or not --blockHashPrefix is being used, because the block hash
+             * prefix is in the same format as the block number (i.e., 32 bit unsigned hexadecimal value).
+             */
+            snprintf(last_block_path, sizeof(last_block_path), "%s%0*jx",
+              config->prefix, S3B_BLOCK_NUM_DIGITS, (uintmax_t)last_possible_block);
+            if (strcmp(io->xml_text, last_block_path) > 0) {
+#if DEBUG_BLOCK_LIST
+                (*config->log)(LOG_DEBUG, "list: key=\"%s\" > last block \"%s\" -> we're done", io->xml_text, last_block_path);
+#endif
+                io->list_truncated = 0;
+            }
         }
     }
 
@@ -703,36 +772,121 @@ http_io_list_text(void *arg, const XML_Char *s, int len)
 }
 
 /*
- * Parse a block's item name (including prefix) and set the corresponding bit in the bitmap.
+ * Parse a block's item name (including prefix and block hash prefix if any) and returns the result in *block_nump.
  */
 int
 http_io_parse_block(struct http_io_conf *config, const char *name, s3b_block_t *block_nump)
 {
     const size_t plen = strlen(config->prefix);
+    s3b_block_t hash_value = 0;
     s3b_block_t block_num = 0;
-    int i;
 
-    /* Check prefix */
+    /* Parse prefix */
     if (strncmp(name, config->prefix, plen) != 0)
         return -1;
     name += plen;
 
-    /* Parse block number */
-    for (i = 0; i < S3B_BLOCK_NUM_DIGITS; i++) {
-        char ch = name[i];
-
-        if (!isxdigit(ch))
-            break;
-        block_num <<= 4;
-        block_num |= ch <= '9' ? ch - '0' : tolower(ch) - 'a' + 10;
+    /* Parse block hash prefix followed by dash (if so configured) */
+    if (config->blockHashPrefix) {
+        if (http_io_parse_hex_block_num(name, &hash_value) == -1)
+            return -1;
+        name += S3B_BLOCK_NUM_DIGITS;
+        if (*name++ != '-')
+            return -1;
     }
 
-    /* Was parse successful? */
-    if (i != S3B_BLOCK_NUM_DIGITS || name[i] != '\0' || block_num >= config->num_blocks)
+    /* Parse block number */
+    if (http_io_parse_hex_block_num(name, &block_num) == -1)
+        return -1;
+    name += S3B_BLOCK_NUM_DIGITS;
+    if (*name != '\0' || block_num >= config->num_blocks)
+        return -1;
+
+    /* Verify hash matches what's expected */
+    if (config->blockHashPrefix && hash_value != http_io_block_hash_prefix(block_num))
         return -1;
 
     /* Done */
     *block_nump = block_num;
+    return 0;
+}
+
+/*
+ * Parse a hexadecimal block number value, which should be S3B_BLOCK_NUM_DIGITS lowercase digits.
+ *
+ * Returns zero on success, -1 on failure.
+ */
+static int
+http_io_parse_hex_block_num(const char *string, s3b_block_t *valuep)
+{
+    s3b_block_t value = 0;
+    int i;
+
+    /* Parse block number */
+    for (i = 0; i < S3B_BLOCK_NUM_DIGITS; i++) {
+        const char ch = string[i];
+
+        value <<= 4;
+        if (ch >= '0' && ch <= '9')
+            value |= ch - '0';
+        else if (ch >= 'a' && ch <= 'f')
+            value |= ch - 'a' + 10;
+        else
+            return -1;
+    }
+
+    /* Done */
+    *valuep = value;
+    return 0;
+}
+
+/*
+ * Append deterministic hash value based on block number for even name distribution.
+ *
+ * Ref: https://github.com/archiecobbs/s3backer/issues/80
+ * Ref: https://crypto.stackexchange.com/questions/16219/cryptographic-hash-function-for-32-bit-length-input-keys
+ */
+void
+http_io_format_block_hash(const struct http_io_conf *const config, char *buf, size_t bufsiz, s3b_block_t block_num)
+{
+    assert(bufsiz >= S3B_BLOCK_NUM_DIGITS + 2);
+    if (config->blockHashPrefix)
+        snprintf(buf, bufsiz, "%0*jx-", S3B_BLOCK_NUM_DIGITS, (uintmax_t)http_io_block_hash_prefix(block_num));
+    else
+        *buf = '\0';
+}
+
+/*
+ * Calculate deterministic hash value based on block number for even name distribution.
+ *
+ * Ref: https://github.com/archiecobbs/s3backer/issues/80
+ * Ref: https://crypto.stackexchange.com/questions/16219/cryptographic-hash-function-for-32-bit-length-input-keys
+ */
+s3b_block_t
+http_io_block_hash_prefix(s3b_block_t block_num)
+{
+    s3b_block_t hash;
+    int n;
+
+    hash = block_num;
+    for (n = 12; n > 0; n--)
+        hash = ((hash >> 8) ^ hash) * 0x6b + n;
+    return hash;
+}
+
+static int
+http_io_create_threads(struct s3backer_store *s3b)
+{
+    struct http_io_private *const priv = s3b->data;
+    struct http_io_conf *const config = priv->config;
+    int r;
+
+    /* Start IAM updater thread if appropriate */
+    if (config->ec2iam_role != NULL
+      && (r = pthread_create(&priv->iam_thread, NULL, update_iam_credentials_main, priv)) != 0)
+        return r;
+
+    /* Done */
     return 0;
 }
 
@@ -792,11 +946,11 @@ http_io_head_prepper(CURL *curl, struct http_io *io)
 }
 
 static int
-http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
+http_io_set_mount_token(struct s3backer_store *s3b, int32_t *old_valuep, int32_t new_value)
 {
     struct http_io_private *const priv = s3b->data;
     struct http_io_conf *const config = priv->config;
-    char urlbuf[URL_BUF_SIZE(config) + sizeof(MOUNTED_FLAG)];
+    char urlbuf[URL_BUF_SIZE(config) + sizeof(MOUNT_TOKEN_FILE)];
     const time_t now = time(NULL);
     struct http_io io;
     int r = 0;
@@ -806,8 +960,8 @@ http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
     io.url = urlbuf;
     io.method = HTTP_HEAD;
 
-    /* Construct URL for the mounted flag */
-    http_io_get_mounted_flag_url(urlbuf, sizeof(urlbuf), config);
+    /* Construct URL for the mount token file */
+    http_io_get_mount_token_file_url(urlbuf, sizeof(urlbuf), config);
 
     /* Get old value */
     if (old_valuep != NULL) {
@@ -826,7 +980,9 @@ http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
             r = 0;
             break;
         case 0:
-            *old_valuep = 1;
+            *old_valuep = io.mount_token;
+            if (*old_valuep == 0)                       // backward compatibility
+                *old_valuep = 1;
             break;
         default:
             goto done;
@@ -834,7 +990,7 @@ http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
     }
 
     /* Set new value */
-    if (new_value != -1) {
+    if (new_value >= 0) {
         char content[_POSIX_HOST_NAME_MAX + DATE_BUF_SIZE + 32];
         u_char md5[MD5_DIGEST_LENGTH];
         char md5buf[MD5_DIGEST_LENGTH * 2 + 1];
@@ -845,17 +1001,17 @@ http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
         curl_slist_free_all(io.headers);
         memset(&io, 0, sizeof(io));
         io.url = urlbuf;
-        io.method = new_value ? HTTP_PUT : HTTP_DELETE;
+        io.method = new_value != 0 ? HTTP_PUT : HTTP_DELETE;
 
         /* Add Date header */
         http_io_add_date(priv, &io, now);
 
         /* To set the flag PUT some content containing current date */
-        if (new_value) {
+        if (new_value != 0) {
             struct tm tm;
 
-            /* Create content for the mounted flag object (timestamp) */
-            gethostname(content, sizeof(content - 1));
+            /* Create content for the mount token file (timestamp) */
+            gethostname(content, sizeof(content) - 1);
             content[sizeof(content) - 1] = '\0';
             strftime(content + strlen(content), sizeof(content) - strlen(content), "\n" AWS_DATE_BUF_FMT "\n", gmtime_r(&now, &tm));
             io.src = content;
@@ -865,28 +1021,34 @@ http_io_set_mounted(struct s3backer_store *s3b, int *old_valuep, int new_value)
             MD5_Final(md5, &ctx);
 
             /* Add Content-Type header */
-            io.headers = http_io_add_header(io.headers, "%s: %s", CTYPE_HEADER, MOUNTED_FLAG_CONTENT_TYPE);
+            io.headers = http_io_add_header(priv, io.headers, "%s: %s", CTYPE_HEADER, MOUNT_TOKEN_FILE_MIME_TYPE);
 
             /* Add Content-MD5 header */
             http_io_base64_encode(md5buf, sizeof(md5buf), md5, MD5_DIGEST_LENGTH);
-            io.headers = http_io_add_header(io.headers, "%s: %s", MD5_HEADER, md5buf);
+            io.headers = http_io_add_header(priv, io.headers, "%s: %s", MD5_HEADER, md5buf);
+
+            /* Add Mount-Token header */
+            io.headers = http_io_add_header(priv, io.headers, "%s: %08x", MOUNT_TOKEN_HEADER, (int)new_value);
+
+            /* Add ACL header */
+            io.headers = http_io_add_header(priv, io.headers, "%s: %s", ACL_HEADER, config->accessType);
         }
 
-        /* Add ACL header (PUT only) */
-        if (new_value)
-            io.headers = http_io_add_header(io.headers, "%s: %s", ACL_HEADER, config->accessType);
+        /* Add Server Side Encryption value (if needed) */
+        if (config->sse != NULL)
+            io.headers = http_io_add_header(priv, io.headers, "%s: %s", SSE_HEADER, config->sse);
 
         /* Add storage class header (if needed) */
         storage_class = config->storage_class != NULL ?
           config->storage_class : config->rrs ? STORAGE_CLASS_REDUCED_REDUNDANCY : NULL;
         if (storage_class != NULL)
-            io.headers = http_io_add_header(io.headers, "%s: %s", STORAGE_CLASS_HEADER, storage_class);
+            io.headers = http_io_add_header(priv, io.headers, "%s: %s", STORAGE_CLASS_HEADER, storage_class);
 
         /* Add Authorization header */
         if ((r = http_io_add_auth(priv, &io, now, io.src, io.buf_size)) != 0)
             goto done;
 
-        /* Perform operation to set or clear mounted flag */
+        /* Perform operation to set or clear mount token */
         r = http_io_perform_io(priv, &io, http_io_write_prepper);
     }
 
@@ -900,7 +1062,7 @@ static int
 update_iam_credentials(struct http_io_private *const priv)
 {
     struct http_io_conf *const config = priv->config;
-    char urlbuf[sizeof(EC2_IAM_META_DATA_URLBASE) + 128];
+    char *urlbuf;
     struct http_io io;
     char buf[2048] = { '\0' };
     char *access_id = NULL;
@@ -910,7 +1072,10 @@ update_iam_credentials(struct http_io_private *const priv)
     int r;
 
     /* Build URL */
-    snprintf(urlbuf, sizeof(urlbuf), "%s%s", EC2_IAM_META_DATA_URLBASE, config->ec2iam_role);
+    if (asprintf(&urlbuf, "%s%s", EC2_IAM_META_DATA_URLBASE, config->ec2iam_role) == -1) {
+        (*config->log)(LOG_ERR, "%s: asprintf() failed: %s", "update_iam_credentials", strerror(ENOMEM));
+        return ENOMEM;
+    }
 
     /* Initialize I/O info */
     memset(&io, 0, sizeof(io));
@@ -923,6 +1088,7 @@ update_iam_credentials(struct http_io_private *const priv)
     (*config->log)(LOG_INFO, "acquiring EC2 IAM credentials from %s", io.url);
     if ((r = http_io_perform_io(priv, &io, http_io_iamcreds_prepper)) != 0) {
         (*config->log)(LOG_ERR, "failed to acquire EC2 IAM credentials from %s: %s", io.url, strerror(r));
+        free(urlbuf);
         return r;
     }
 
@@ -939,6 +1105,7 @@ update_iam_credentials(struct http_io_private *const priv)
         (*config->log)(LOG_ERR, "failed to extract EC2 IAM credentials from response: %s", strerror(errno));
         free(access_id);
         free(access_key);
+        free(urlbuf);
         return EINVAL;
     }
 
@@ -952,6 +1119,7 @@ update_iam_credentials(struct http_io_private *const priv)
     config->iam_token = iam_token;
     pthread_mutex_unlock(&priv->mutex);
     (*config->log)(LOG_INFO, "successfully updated EC2 IAM credentials from %s", io.url);
+    free(urlbuf);
 
     /* Done */
     return 0;
@@ -1102,7 +1270,7 @@ http_io_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, void
             io.expect_304 = 1;
         }
         http_io_prhex(md5buf, expect_md5, MD5_DIGEST_LENGTH);
-        io.headers = http_io_add_header(io.headers, "%s: \"%s\"", header, md5buf);
+        io.headers = http_io_add_header(priv, io.headers, "%s: \"%s\"", header, md5buf);
     }
 
     /* Set Accept-Encoding header */
@@ -1111,7 +1279,7 @@ http_io_read_block(struct s3backer_store *const s3b, s3b_block_t block_num, void
         snprintf(accepted_encodings + strlen(accepted_encodings), sizeof(accepted_encodings) - strlen(accepted_encodings),
           ", %s-%s", CONTENT_ENCODING_ENCRYPT, config->encryption);
     }
-    io.headers = http_io_add_header(io.headers, "%s: %s", ACCEPT_ENCODING_HEADER, accepted_encodings);
+    io.headers = http_io_add_header(priv, io.headers, "%s: %s", ACCEPT_ENCODING_HEADER, accepted_encodings);
 
     /* Add Authorization header */
     if ((r = http_io_add_auth(priv, &io, now, NULL, 0)) != 0)
@@ -1481,7 +1649,7 @@ http_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
             snprintf(ebuf + strlen(ebuf), sizeof(ebuf) - strlen(ebuf), "%s%s-%s",
               compressed ? ", " : "", CONTENT_ENCODING_ENCRYPT, config->encryption);
         }
-        io.headers = http_io_add_header(io.headers, "%s", ebuf);
+        io.headers = http_io_add_header(priv, io.headers, "%s", ebuf);
     }
 
     /* Compute MD5 checksum */
@@ -1504,32 +1672,36 @@ http_io_write_block(struct s3backer_store *const s3b, s3b_block_t block_num, con
     if (src != NULL) {
 
         /* Add Content-Type header */
-        io.headers = http_io_add_header(io.headers, "%s: %s", CTYPE_HEADER, CONTENT_TYPE);
+        io.headers = http_io_add_header(priv, io.headers, "%s: %s", CTYPE_HEADER, CONTENT_TYPE);
 
         /* Add Content-MD5 header */
         http_io_base64_encode(md5buf, sizeof(md5buf), md5, MD5_DIGEST_LENGTH);
-        io.headers = http_io_add_header(io.headers, "%s: %s", MD5_HEADER, md5buf);
+        io.headers = http_io_add_header(priv, io.headers, "%s: %s", MD5_HEADER, md5buf);
     }
 
     /* Add ACL header (PUT only) */
     if (src != NULL)
-        io.headers = http_io_add_header(io.headers, "%s: %s", ACL_HEADER, config->accessType);
+        io.headers = http_io_add_header(priv, io.headers, "%s: %s", ACL_HEADER, config->accessType);
 
     /* Add file size meta-data to zero'th block */
     if (src != NULL && block_num == 0) {
-        io.headers = http_io_add_header(io.headers, "%s: %u", BLOCK_SIZE_HEADER, config->block_size);
-        io.headers = http_io_add_header(io.headers, "%s: %ju",
+        io.headers = http_io_add_header(priv, io.headers, "%s: %u", BLOCK_SIZE_HEADER, config->block_size);
+        io.headers = http_io_add_header(priv, io.headers, "%s: %ju",
           FILE_SIZE_HEADER, (uintmax_t)(config->block_size * config->num_blocks));
     }
 
     /* Add signature header (if encrypting) */
     if (src != NULL && config->encryption != NULL)
-        io.headers = http_io_add_header(io.headers, "%s: \"%s\"", HMAC_HEADER, hmacbuf);
+        io.headers = http_io_add_header(priv, io.headers, "%s: \"%s\"", HMAC_HEADER, hmacbuf);
+
+    /* Add Server Side Encryption header (if needed) */
+    if (config->sse != NULL)
+        io.headers = http_io_add_header(priv, io.headers, "%s: %s", SSE_HEADER, config->sse);
 
     /* Add storage class header (if needed) */
     storage_class = config->storage_class != NULL ? config->storage_class : config->rrs ? STORAGE_CLASS_REDUCED_REDUNDANCY : NULL;
     if (storage_class != NULL)
-        io.headers = http_io_add_header(io.headers, "%s: %s", STORAGE_CLASS_HEADER, storage_class);
+        io.headers = http_io_add_header(priv, io.headers, "%s: %s", STORAGE_CLASS_HEADER, storage_class);
 
     /* Add Authorization header */
     if ((r = http_io_add_auth(priv, &io, now, io.src, io.buf_size)) != 0)
@@ -1913,7 +2085,7 @@ http_io_add_auth2(struct http_io_private *priv, struct http_io *const io, time_t
     HMAC_Update(hmac_ctx, (const u_char *)config->bucket, strlen(config->bucket));
     HMAC_Update(hmac_ctx, (const u_char *)resource, resource_len);
 #if DEBUG_AUTHENTICATION
-    snprintf(sigbuf + strlen(sigbuf), sizeof(sigbuf) - strlen(sigbuf), "/%s%.*s", config->bucket, resource_len, resource);
+    snprintf(sigbuf + strlen(sigbuf), sizeof(sigbuf) - strlen(sigbuf), "/%s%.*s", config->bucket, (int)resource_len, resource);
 #endif
 
     /* Finish up */
@@ -1931,7 +2103,7 @@ http_io_add_auth2(struct http_io_private *priv, struct http_io *const io, time_t
 #endif
 
     /* Add auth header */
-    io->headers = http_io_add_header(io->headers, "%s: AWS %s:%s", AUTH_HEADER, access_id, authbuf);
+    io->headers = http_io_add_header(priv, io->headers, "%s: AWS %s:%s", AUTH_HEADER, access_id, authbuf);
 
     /* Done */
     r = 0;
@@ -1980,7 +2152,7 @@ http_io_add_auth4(struct http_io_private *priv, struct http_io *const io, time_t
     char datebuf[DATE_BUF_SIZE];
     char access_id[128];
     char access_key[128];
-    char iam_token[1024];
+    char *iam_token = NULL;
     struct tm tm;
     char *p;
     int r;
@@ -1993,13 +2165,19 @@ http_io_add_auth4(struct http_io_private *priv, struct http_io *const io, time_t
     pthread_mutex_lock(&priv->mutex);
     snprintf(access_id, sizeof(access_id), "%s", config->accessId);
     snprintf(access_key, sizeof(access_key), "%s%s", ACCESS_KEY_PREFIX, config->accessKey);
-    snprintf(iam_token, sizeof(iam_token), "%s", config->iam_token != NULL ? config->iam_token : "");
+    if (config->iam_token != NULL && (iam_token = strdup(config->iam_token)) == NULL) {
+        r = errno;
+        pthread_mutex_unlock(&priv->mutex);
+        (*config->log)(LOG_ERR, "%s: strdup: %s", "http_io_add_auth4", strerror(r));
+        goto fail;
+    }
     pthread_mutex_unlock(&priv->mutex);
 
     /* Extract host, URI path, and query parameters from URL */
     if ((p = strchr(io->url, ':')) == NULL || *++p != '/' || *++p != '/'
       || (host = p + 1) == NULL || (uripath = strchr(host, '/')) == NULL) {
         r = EINVAL;
+        free(iam_token);
         goto fail;
     }
     host_len = uripath - host;
@@ -2024,12 +2202,14 @@ http_io_add_auth4(struct http_io_private *priv, struct http_io *const io, time_t
     EVP_DigestFinal_ex(hash_ctx, payload_hash, &payload_hash_len);
     http_io_prhex(payload_hash_buf, payload_hash, payload_hash_len);
 
-    io->headers = http_io_add_header(io->headers, "%s: %s", CONTENT_SHA256_HEADER, payload_hash_buf);
+    io->headers = http_io_add_header(priv, io->headers, "%s: %s", CONTENT_SHA256_HEADER, payload_hash_buf);
 
 /****** Add IAM security token header (if any) ******/
 
-    if (*iam_token != '\0')
-        io->headers = http_io_add_header(io->headers, "%s: %s", SECURITY_TOKEN_HEADER, iam_token);
+    if (iam_token != NULL && *iam_token != '\0') {
+        io->headers = http_io_add_header(priv, io->headers, "%s: %s", SECURITY_TOKEN_HEADER, iam_token);
+        free(iam_token);
+    }
 
 /****** Create Hashed Canonical Request ******/
 
@@ -2226,7 +2406,7 @@ http_io_add_auth4(struct http_io_private *priv, struct http_io *const io, time_t
 
 /****** Add Authorization Header ******/
 
-    io->headers = http_io_add_header(io->headers, "%s: %s Credential=%s/%.8s/%s/%s/%s, SignedHeaders=%s, Signature=%s",
+    io->headers = http_io_add_header(priv, io->headers, "%s: %s Credential=%s/%.8s/%s/%s/%s, SignedHeaders=%s, Signature=%s",
       AUTH_HEADER, SIGNATURE_ALGORITHM, access_id, datebuf, config->region, S3_SERVICE_NAME, SIGNATURE_TERMINATOR,
       header_names, hmac_buf);
 
@@ -2287,30 +2467,33 @@ url_encode(const char *src, size_t len, char *dst, size_t buflen, int encode_sla
 static void
 http_io_get_block_url(char *buf, size_t bufsiz, struct http_io_conf *config, s3b_block_t block_num)
 {
+    char block_hash_buf[S3B_BLOCK_NUM_DIGITS + 2];
     int len;
 
-    if (config->vhost)
-        len = snprintf(buf, bufsiz, "%s%s%0*jx", config->baseURL, config->prefix, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
-    else {
-        len = snprintf(buf, bufsiz, "%s%s/%s%0*jx", config->baseURL,
-          config->bucket, config->prefix, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
+    http_io_format_block_hash(config, block_hash_buf, sizeof(block_hash_buf), block_num);
+    if (config->vhost) {
+        len = snprintf(buf, bufsiz, "%s%s%s%0*jx", config->baseURL,
+          config->prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
+    } else {
+        len = snprintf(buf, bufsiz, "%s%s/%s%s%0*jx", config->baseURL,
+          config->bucket, config->prefix, block_hash_buf, S3B_BLOCK_NUM_DIGITS, (uintmax_t)block_num);
     }
     (void)len;                  /* avoid compiler warning when NDEBUG defined */
     assert(len < bufsiz);
 }
 
 /*
- * Create URL for the mounted flag, and return pointer to the URL's path not including any "/bucket" prefix.
+ * Create URL for the mount token file, and return pointer to the URL's path not including any "/bucket" prefix.
  */
 static void
-http_io_get_mounted_flag_url(char *buf, size_t bufsiz, struct http_io_conf *config)
+http_io_get_mount_token_file_url(char *buf, size_t bufsiz, struct http_io_conf *config)
 {
     int len;
 
     if (config->vhost)
-        len = snprintf(buf, bufsiz, "%s%s%s", config->baseURL, config->prefix, MOUNTED_FLAG);
+        len = snprintf(buf, bufsiz, "%s%s%s", config->baseURL, config->prefix, MOUNT_TOKEN_FILE);
     else
-        len = snprintf(buf, bufsiz, "%s%s/%s%s", config->baseURL, config->bucket, config->prefix, MOUNTED_FLAG);
+        len = snprintf(buf, bufsiz, "%s%s/%s%s", config->baseURL, config->bucket, config->prefix, MOUNT_TOKEN_FILE);
     (void)len;                  /* avoid compiler warning when NDEBUG defined */
     assert(len < bufsiz);
 }
@@ -2327,22 +2510,26 @@ http_io_add_date(struct http_io_private *const priv, struct http_io *const io, t
 
     if (strcmp(config->authVersion, AUTH_VERSION_AWS2) == 0) {
         strftime(buf, sizeof(buf), HTTP_DATE_BUF_FMT, gmtime_r(&now, &tm));
-        io->headers = http_io_add_header(io->headers, "%s: %s", HTTP_DATE_HEADER, buf);
+        io->headers = http_io_add_header(priv, io->headers, "%s: %s", HTTP_DATE_HEADER, buf);
     } else {
         strftime(buf, sizeof(buf), AWS_DATE_BUF_FMT, gmtime_r(&now, &tm));
-        io->headers = http_io_add_header(io->headers, "%s: %s", AWS_DATE_HEADER, buf);
+        io->headers = http_io_add_header(priv, io->headers, "%s: %s", AWS_DATE_HEADER, buf);
     }
 }
 
 static struct curl_slist *
-http_io_add_header(struct curl_slist *headers, const char *fmt, ...)
+http_io_add_header(struct http_io_private *priv, struct curl_slist *headers, const char *fmt, ...)
 {
-    char buf[1024];
+    char *buf;
     va_list args;
 
     va_start(args, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    headers = curl_slist_append(headers, buf);
+    if (vasprintf(&buf, fmt, args) == -1)
+        (*priv->config->log)(LOG_ERR, "%s: vasprintf() failed: %s", "http_io_add_header", strerror(ENOMEM));
+    else {
+        headers = curl_slist_append(headers, buf);
+        free(buf);
+    }
     va_end(args);
     return headers;
 }
@@ -2378,6 +2565,9 @@ http_io_acquire_curl(struct http_io_private *priv, struct http_io *io)
     curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, (long)1);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, (long)1);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, (long)TCP_KEEP_ALIVE_IDLE);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, (long)TCP_KEEP_ALIVE_INTERVAL);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)config->timeout);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 1);
     curl_easy_setopt(curl, CURLOPT_USERAGENT, config->user_agent);
@@ -2436,8 +2626,9 @@ http_io_curl_header(void *ptr, size_t size, size_t nmemb, void *stream)
 {
     struct http_io *const io = (struct http_io *)stream;
     const size_t total = size * nmemb;
-    char fmtbuf[64];
+    char hashbuf[64];
     char buf[1024];
+    u_int mtoken;
 
     /* Null-terminate header */
     if (total > sizeof(buf) - 1)
@@ -2446,26 +2637,24 @@ http_io_curl_header(void *ptr, size_t size, size_t nmemb, void *stream)
     buf[total] = '\0';
 
     /* Check for interesting headers */
-    (void)sscanf(buf, FILE_SIZE_HEADER ": %ju", &io->file_size);
-    (void)sscanf(buf, BLOCK_SIZE_HEADER ": %u", &io->block_size);
+    (void)http_io_parse_header(buf, FILE_SIZE_HEADER, "%ju", &io->file_size);
+    (void)http_io_parse_header(buf, BLOCK_SIZE_HEADER, "%u", &io->block_size);
+    if (http_io_parse_header(buf, MOUNT_TOKEN_HEADER, "%x", &mtoken) == 1)
+        io->mount_token = (int32_t)mtoken;
 
-    /* ETag header requires parsing */
-    if (strncasecmp(buf, ETAG_HEADER ":", sizeof(ETAG_HEADER)) == 0) {
-        char md5buf[MD5_DIGEST_LENGTH * 2 + 1];
+    /* ETag header */
+#if MD5_DIGEST_LENGTH != 16
+#error unexpected MD5_DIGEST_LENGTH
+#endif
+    if (http_io_parse_header(buf, ETAG_HEADER, "\"%32c\"", hashbuf) == 1)
+        http_io_parse_hex(hashbuf, io->md5, MD5_DIGEST_LENGTH);
 
-        snprintf(fmtbuf, sizeof(fmtbuf), " \"%%%uc\"", MD5_DIGEST_LENGTH * 2);
-        if (sscanf(buf + sizeof(ETAG_HEADER), fmtbuf, md5buf) == 1)
-            http_io_parse_hex(md5buf, io->md5, MD5_DIGEST_LENGTH);
-    }
-
-    /* "x-amz-meta-s3backer-hmac" header requires parsing */
-    if (strncasecmp(buf, HMAC_HEADER ":", sizeof(HMAC_HEADER)) == 0) {
-        char hmacbuf[SHA_DIGEST_LENGTH * 2 + 1];
-
-        snprintf(fmtbuf, sizeof(fmtbuf), " \"%%%uc\"", SHA_DIGEST_LENGTH * 2);
-        if (sscanf(buf + sizeof(HMAC_HEADER), fmtbuf, hmacbuf) == 1)
-            http_io_parse_hex(hmacbuf, io->hmac, SHA_DIGEST_LENGTH);
-    }
+    /* "x-amz-meta-s3backer-hmac" header */
+#if SHA_DIGEST_LENGTH != 20
+#error unexpected MD5_DIGEST_LENGTH
+#endif
+    if (http_io_parse_header(buf, HMAC_HEADER, "\"%40c\"", hashbuf) == 1)
+        http_io_parse_hex(hashbuf, io->hmac, SHA_DIGEST_LENGTH);
 
     /* Content encoding(s) */
     if (strncasecmp(buf, CONTENT_ENCODING_HEADER ":", sizeof(CONTENT_ENCODING_HEADER)) == 0) {
@@ -2665,7 +2854,7 @@ update_hmac_from_header(HMAC_CTX *const ctx, struct http_io *const io,
             if (!value_only) {
                 HMAC_Update(ctx, (const u_char *)header->data, name_len + 1);
 #if DEBUG_AUTHENTICATION
-                snprintf(sigbuf + strlen(sigbuf), sigbuflen - strlen(sigbuf), "%.*s", name_len + 1, header->data);
+                snprintf(sigbuf + strlen(sigbuf), sigbuflen - strlen(sigbuf), "%.*s", (int)name_len + 1, header->data);
 #endif
             }
             for (value = header->data + name_len + 1; isspace(*value); value++)
@@ -2738,3 +2927,28 @@ http_io_strcasecmp_ptr(const void *const ptr1, const void *const ptr2)
     return strcasecmp(str1, str2);
 }
 
+static int
+http_io_parse_header(const char *const input, const char *const header, const char *const fmt, ...)
+{
+
+    va_list args;
+    size_t offset;
+    int rtn;
+
+    /* Initialize */
+    va_start(args, fmt);
+
+    /* Match header (case-insensitively) followed by ':' and optional whitespace */
+    offset = strlen(header);
+    if (strncasecmp(input, header, offset) != 0 || input[offset++] != ':')
+        return -1;
+    while (isspace(input[offset]))
+        offset++;
+
+    /* Parse header value */
+    rtn = vsscanf(input + offset, fmt, args);
+
+    /* Done */
+    va_end(args);
+    return rtn;
+}

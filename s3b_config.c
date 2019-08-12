@@ -41,6 +41,7 @@
 #include "http_io.h"
 #include "test_io.h"
 #include "s3b_config.h"
+#include "dcache.h"
 
 /****************************************************************************
  *                          DEFINITIONS                                     *
@@ -105,6 +106,7 @@ struct list_blocks {
  ****************************************************************************/
 
 static print_stats_t s3b_config_print_stats;
+static clear_stats_t s3b_config_clear_stats;
 
 static int parse_size_string(const char *s, uintmax_t *valp);
 static void unparse_size_string(char *buf, size_t bmax, uintmax_t value);
@@ -149,6 +151,8 @@ static struct s3b_config config = {
         .baseURL=               NULL,
         .region=                NULL,
         .bucket=                NULL,
+        .sse=                   NULL,
+        .blockHashPrefix=       0,
         .prefix=                S3BACKER_DEFAULT_PREFIX,
         .accessType=            S3BACKER_DEFAULT_ACCESS_TYPE,
         .authVersion=           S3BACKER_DEFAULT_AUTH_VERSION,
@@ -239,6 +243,10 @@ static const struct fuse_opt option_list[] = {
         .offset=    offsetof(struct s3b_config, http_io.region),
     },
     {
+        .templ=     "--sse=%s",
+        .offset=    offsetof(struct s3b_config, http_io.sse),
+    },
+    {
         .templ=     "--blockCacheSize=%u",
         .offset=    offsetof(struct s3b_config, block_cache.cache_size),
     },
@@ -262,6 +270,11 @@ static const struct fuse_opt option_list[] = {
     {
         .templ=     "--blockCacheMaxDirty=%u",
         .offset=    offsetof(struct s3b_config, block_cache.max_dirty),
+    },
+    {
+        .templ=     "--blockCacheRecoverDirtyBlocks",
+        .offset=    offsetof(struct s3b_config, block_cache.recover_dirty_blocks),
+        .value=     1
     },
     {
         .templ=     "--readAhead=%u",
@@ -359,6 +372,11 @@ static const struct fuse_opt option_list[] = {
     {
         .templ=     "--minWriteDelay=%u",
         .offset=    offsetof(struct s3b_config, ec_protect.min_write_delay),
+    },
+    {
+        .templ=     "--blockHashPrefix",
+        .offset=    offsetof(struct s3b_config, http_io.blockHashPrefix),
+        .value=     1
     },
     {
         .templ=     "--prefix=%s",
@@ -571,6 +589,7 @@ s3backer_get_config(int argc, char **argv)
 
     /* Set up fuse_ops callbacks */
     config.fuse_ops.print_stats = s3b_config_print_stats;
+    config.fuse_ops.clear_stats = s3b_config_clear_stats;
     config.fuse_ops.s3bconf = &config;
 
     /* Debug */
@@ -582,13 +601,14 @@ s3backer_get_config(int argc, char **argv)
 }
 
 /*
- * Create the s3backer_store used at runtime. This method is invoked by fuse_op_init().
+ * Create the s3backer_store used at runtime.
  */
 struct s3backer_store *
 s3backer_create_store(struct s3b_config *conf)
 {
     struct s3backer_store *store;
-    int mounted;
+    int32_t old_mount_token;
+    int32_t new_mount_token;
     int r;
 
     /* Sanity check */
@@ -622,19 +642,28 @@ s3backer_create_store(struct s3b_config *conf)
         store = block_cache_store;
     }
 
-    /* Set mounted flag and check previous value one last time */
-    r = (*store->set_mounted)(store, &mounted, conf->fuse_ops.read_only ? -1 : 1);
-    if (r != 0) {
-        (*conf->log)(LOG_ERR, "error reading mounted flag on %s: %s", conf->description, strerror(r));
+    /* Set mount token and check previous value one last time */
+    new_mount_token = -1;
+    if (!conf->fuse_ops.read_only) {
+        srandom((long)time(NULL) ^ (long)&old_mount_token);
+        do
+            new_mount_token = random();
+        while (new_mount_token <= 0);
+    }
+    if ((r = (*store->set_mount_token)(store, &old_mount_token, new_mount_token)) != 0) {
+        (*conf->log)(LOG_ERR, "error reading mount token on %s: %s", conf->description, strerror(r));
         goto fail;
     }
-    if (mounted) {
-        if (!conf->force) {
-            (*conf->log)(LOG_ERR, "%s appears to be mounted by another s3backer process", config.description);
+    if (old_mount_token != 0) {
+        if (!conf->force && !conf->block_cache.perform_flush) {
+            (*conf->log)(LOG_ERR, "%s appears to be mounted by another s3backer process (using mount token 0x%08x)",
+              config.description, (int)old_mount_token);
             r = EBUSY;
             goto fail;
         }
     }
+    if (new_mount_token != -1)
+        (*conf->log)(LOG_INFO, "established new mount token 0x%08x", (int)new_mount_token);
 
     /* Done */
     return store;
@@ -755,6 +784,22 @@ s3b_config_print_stats(void *prarg, printer_t *printer)
         total_oom += ec_protect_stats.out_of_memory_errors;
     }
     (*printer)(prarg, "%-28s %u\n", "out_of_memory_errors", total_oom);
+}
+
+static void
+s3b_config_clear_stats(void)
+{
+    /* Clear HTTP stats */
+    if (http_io_store != NULL)
+        http_io_clear_stats(http_io_store);
+
+    /* Clear EC protection stats */
+    if (ec_protect_store != NULL)
+        ec_protect_clear_stats(ec_protect_store);
+
+    /* Clear block cache stats */
+    if (block_cache_store != NULL)
+        block_cache_clear_stats(block_cache_store);
 }
 
 static int
@@ -938,7 +983,8 @@ validate_config(void)
         config.http_io.accessId = NULL;
 
     /* If no accessId, only read operations will succeed */
-    if (config.http_io.accessId == NULL && !config.fuse_ops.read_only && !customBaseURL && config.http_io.ec2iam_role == NULL) {
+    if (!config.test && config.http_io.accessId == NULL
+      && !config.fuse_ops.read_only && !customBaseURL && config.http_io.ec2iam_role == NULL) {
         warnx("warning: no `accessId' specified; only read operations will succeed");
         warnx("you can eliminate this warning by providing the `--readOnly' flag");
     }
@@ -1005,6 +1051,12 @@ validate_config(void)
       && strcmp(config.http_io.storage_class, STORAGE_CLASS_STANDARD_IA) != 0
       && strcmp(config.http_io.storage_class, STORAGE_CLASS_REDUCED_REDUNDANCY) != 0) {
         warnx("invalid storage class `%s'", config.http_io.storage_class);
+        return -1;
+    }
+
+    /* Check server side encryption type */
+    if (config.http_io.sse != NULL && strcmp(config.http_io.sse, REQUIRED_SSE_VALUE) != 0) {
+        warnx("invalid sse type `%s' (only `%s' is supported)", config.http_io.sse, REQUIRED_SSE_VALUE);
         return -1;
     }
 
@@ -1202,7 +1254,7 @@ validate_config(void)
     }
     if (config.file_size_str != NULL) {
         if (parse_size_string(config.file_size_str, &value) == -1 || value == 0) {
-            warnx("invalid file size `%s'", config.block_size_str);
+            warnx("invalid file size `%s'", config.file_size_str);
             return -1;
         }
         config.file_size = value;
@@ -1246,6 +1298,10 @@ validate_config(void)
               config.block_cache.cache_size, config.block_size);
             return -1;
         }
+    }
+    if (config.block_cache.cache_file == NULL && config.block_cache.recover_dirty_blocks) {
+        warnx("`--blockCacheRecoverDirtyBlocks' requires specifying `--blockCacheFile'");
+        return -1;
     }
 
     /* Check mount point */
@@ -1353,31 +1409,6 @@ validate_config(void)
         break;
     }
 
-    /* Check whether already mounted */
-    if (!config.test && !config.erase && !config.reset) {
-        int mounted;
-
-        config.http_io.debug = config.debug;
-        config.http_io.quiet = config.quiet;
-        config.http_io.log = config.log;
-        if ((s3b = http_io_create(&config.http_io)) == NULL)
-            err(1, "http_io_create");
-        r = (*s3b->set_mounted)(s3b, &mounted, -1);
-        (*s3b->destroy)(s3b);
-        if (r != 0) {
-            errno = r;
-            err(1, "error reading mounted flag");
-        }
-        if (mounted) {
-            if (!config.force)
-                errx(1, "error: %s appears to be already mounted", config.description);
-            if (!config.quiet) {
-                warnx("warning: filesystem appears already mounted but you said `--force'\n"
-                  " so I'll proceed anyway even though your data may get corrupted.\n");
-            }
-        }
-    }
-
     /* Check computed block and file sizes */
     if (config.block_size != (1 << (ffs(config.block_size) - 1))) {
         warnx("block size must be a power of 2");
@@ -1466,6 +1497,89 @@ validate_config(void)
     config.fuse_ops.num_blocks = config.num_blocks;
     config.fuse_ops.log = config.log;
 
+    /* Check whether already mounted, and if so, compare mount token against on-disk cache (if any) */
+    if (!config.test && !config.erase && !config.reset) {
+        int32_t mount_token;
+        int conflict;
+
+        /* Read s3 mount token */
+        config.http_io.debug = config.debug;
+        config.http_io.quiet = config.quiet;
+        config.http_io.log = config.log;
+        if ((s3b = http_io_create(&config.http_io)) == NULL)
+            err(1, "http_io_create");
+        r = (*s3b->set_mount_token)(s3b, &mount_token, -1);
+        (*s3b->destroy)(s3b);
+        if (r != 0) {
+            errno = r;
+            err(1, "error reading mount token");
+        }
+        conflict = mount_token != 0;
+
+        /*
+         * The disk cache also has a mount token, so we need to do some extra checking.
+         * Either token can be 0 (i.e., not present -> not mounted) or != 0 (mounted).
+         *
+         * If neither token is present, proceed with mount. Note: there should not be
+         * any dirty blocks in the disk cache in this case, because this represents a
+         * clean unmount situation.
+         *
+         * If the cache has a token, but S3 has none, that means someone must have used
+         * `--reset-mounted-flag' to clear it from S3 since the last time the disk cache was
+         * used. In that case, `--force' is required to continue using the disk cache,
+         * or `--reset-mounted-flag' must be used to clear the disk cache flag as well.
+         *
+         * If --blockCacheRecoverDirtyBlocks is specified and the tokens match, we
+         * have the corresponding cache file for the last mount. Proceed with mount and,
+         * if configured, enable cache writeback of dirty blocks.
+         */
+        if (config.block_cache.cache_file != NULL) {
+            int32_t cache_mount_token = -1;
+            struct stat cache_file_stat;
+            struct s3b_dcache *dcache;
+
+            /* Open disk cache file, if any, and read the mount token therein, if any */
+            if (stat(config.block_cache.cache_file, &cache_file_stat) == -1) {
+                if (errno != ENOENT)
+                    err(1, "can't open cache file `%s'", config.block_cache.cache_file);
+            } else {
+                if ((r = s3b_dcache_open(&dcache, config.log, config.block_cache.cache_file,
+                  config.block_cache.block_size, config.block_cache.cache_size, NULL, NULL, 0)) != 0)
+                    errx(1, "error opening cache file `%s': %s", config.block_cache.cache_file, strerror(r));
+                if (s3b_dcache_has_mount_token(dcache) && (r = s3b_dcache_set_mount_token(dcache, &cache_mount_token, -1)) != 0)
+                    errx(1, "error reading mount token from `%s': %s", config.block_cache.cache_file, strerror(r));
+                s3b_dcache_close(dcache);
+            }
+
+            /* If cache file is older format, then cache_mount_token will be -1, otherwise >= 0 */
+            if (cache_mount_token > 0) {
+
+                /* If tokens do not agree, bail out, otherwise enable write-back of dirty blocks if tokens are non-zero */
+                if (cache_mount_token != mount_token) {
+                    warnx("cache file `%s' mount token mismatch (disk:0x%08x != s3:0x%08x)",
+                      config.block_cache.cache_file, cache_mount_token, mount_token);
+                } else if (config.block_cache.recover_dirty_blocks) {
+                    if (!config.quiet)
+                        warnx("recovering from unclean shutdown: dirty blocks in cache file will be written back to S3");
+                    config.block_cache.perform_flush = 1;
+                    conflict = 0;
+                }
+            }
+        }
+
+        /* If there is a conflicting mount, additional `--force' is required */
+        if (conflict) {
+            if (!config.force) {
+                warnx("%s appears to be already mounted (using mount token 0x%08x)", config.description, (int)mount_token);
+                errx(1, "reset mount token with `--reset-mounted-flag', or use `--force' to override");
+            }
+            if (!config.quiet) {
+                warnx("warning: filesystem appears already mounted but you said `--force'\n"
+                  " so I'll proceed anyway even though your data may get corrupted.\n");
+            }
+        }
+    }
+
     /* If `--listBlocks' was given, build non-empty block bitmap */
     if (config.erase || config.reset)
         config.list_blocks = 0;
@@ -1545,6 +1659,7 @@ dump_config(void)
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "region", config.http_io.region);
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", config.test ? "testdir" : "bucket", config.http_io.bucket);
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "prefix", config.http_io.prefix);
+    (*config.log)(LOG_DEBUG, "%24s: %s", "blockHashPrefix", config.http_io.blockHashPrefix ? "true" : "false");
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "defaultContentEncoding",
       config.http_io.default_ce != NULL ? config.http_io.default_ce : "(none)");
     (*config.log)(LOG_DEBUG, "%24s: %s", "list_blocks", config.list_blocks ? "true" : "false");
@@ -1569,6 +1684,7 @@ dump_config(void)
       config.max_speed_str[HTTP_DOWNLOAD] != NULL ? config.max_speed_str[HTTP_DOWNLOAD] : "-",
       config.http_io.max_speed[HTTP_DOWNLOAD]);
     (*config.log)(LOG_DEBUG, "%24s: %us", "timeout", config.http_io.timeout);
+    (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "sse", config.http_io.sse);
     (*config.log)(LOG_DEBUG, "%24s: %ums", "initial_retry_pause", config.http_io.initial_retry_pause);
     (*config.log)(LOG_DEBUG, "%24s: %ums", "max_retry_pause", config.http_io.max_retry_pause);
     (*config.log)(LOG_DEBUG, "%24s: %ums", "min_write_delay", config.ec_protect.min_write_delay);
@@ -1580,6 +1696,7 @@ dump_config(void)
     (*config.log)(LOG_DEBUG, "%24s: %ums", "block_cache_write_delay", config.block_cache.write_delay);
     (*config.log)(LOG_DEBUG, "%24s: %u blocks", "block_cache_max_dirty", config.block_cache.max_dirty);
     (*config.log)(LOG_DEBUG, "%24s: %s", "block_cache_sync", config.block_cache.synchronous ? "true" : "false");
+    (*config.log)(LOG_DEBUG, "%24s: %s", "recover_dirty_blocks", config.block_cache.recover_dirty_blocks ? "true" : "false");
     (*config.log)(LOG_DEBUG, "%24s: %u blocks", "read_ahead", config.block_cache.read_ahead);
     (*config.log)(LOG_DEBUG, "%24s: %u blocks", "read_ahead_trigger", config.block_cache.read_ahead_trigger);
     (*config.log)(LOG_DEBUG, "%24s: \"%s\"", "block_cache_cache_file",
@@ -1681,10 +1798,12 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheNoVerify", "Disable verification of data loaded from cache file");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSize=NUM", "Block cache size (in number of blocks)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheSync", "Block cache performs all writes synchronously");
+    fprintf(stderr, "\t--%-27s %s\n", "blockCacheRecoverDirtyBlocks", "Recover dirty cache file blocks on startup");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheThreads=NUM", "Block cache write-back thread pool size");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheTimeout=MILLIS", "Block cache entry timeout (zero = infinite)");
     fprintf(stderr, "\t--%-27s %s\n", "blockCacheWriteDelay=MILLIS", "Block cache maximum write-back delay");
     fprintf(stderr, "\t--%-27s %s\n", "blockSize=SIZE", "Block size (with optional suffix 'K', 'M', 'G', etc.)");
+    fprintf(stderr, "\t--%-27s %s\n", "blockHashPrefix", "Prepend hash to block names for even distribution");
     fprintf(stderr, "\t--%-27s %s\n", "cacert=FILE", "Specify SSL certificate authority file");
     fprintf(stderr, "\t--%-27s %s\n", "compress[=LEVEL]", "Enable block compression, with 1=fast up to 9=small");
     fprintf(stderr, "\t--%-27s %s\n", "debug", "Enable logging of debug messages");
@@ -1696,7 +1815,7 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "filename=NAME", "Name of backed file in filesystem");
     fprintf(stderr, "\t--%-27s %s\n", "force", "Ignore different auto-detected block and file sizes");
     fprintf(stderr, "\t--%-27s %s\n", "help", "Show this information and exit");
-    fprintf(stderr, "\t--%-27s %s\n", "initialRetryPause=MILLIS", "Inital retry pause after stale data or server error");
+    fprintf(stderr, "\t--%-27s %s\n", "initialRetryPause=MILLIS", "Initial retry pause after stale data or server error");
     fprintf(stderr, "\t--%-27s %s\n", "insecure", "Don't verify SSL server identity");
     fprintf(stderr, "\t--%-27s %s\n", "keyLength", "Override generated cipher key length");
     fprintf(stderr, "\t--%-27s %s\n", "listBlocks", "Auto-detect non-empty blocks at startup");
@@ -1718,6 +1837,7 @@ usage(void)
     fprintf(stderr, "\t--%-27s %s\n", "reset-mounted-flag", "Reset `already mounted' flag in the filesystem");
     fprintf(stderr, "\t--%-27s %s\n", "rrs", "Target written blocks for Reduced Redundancy Storage (deprecated)");
     fprintf(stderr, "\t--%-27s %s\n", "size=SIZE", "File size (with optional suffix 'K', 'M', 'G', etc.)");
+    fprintf(stderr, "\t--%-27s %s\n", "sse=" REQUIRED_SSE_VALUE, "Specify server side encryption");
     fprintf(stderr, "\t--%-27s %s\n", "ssl", "Enable SSL");
     fprintf(stderr, "\t--%-27s %s\n", "statsFilename=NAME", "Name of statistics file in filesystem");
     fprintf(stderr, "\t--%-27s %s\n", "storageClass=TYPE", "Specify storage class for written blocks");

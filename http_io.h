@@ -47,6 +47,9 @@
 #define STORAGE_CLASS_STANDARD_IA           "STANDARD_IA"
 #define STORAGE_CLASS_REDUCED_REDUNDANCY    "REDUCED_REDUNDANCY"
 
+/* Server side encryption types */
+#define REQUIRED_SSE_VALUE                  "AES256"
+
 /* Configuration info structure for http_io store */
 struct http_io_conf {
     char                *accessId;
@@ -73,6 +76,7 @@ struct http_io_conf {
     int                 compress;                   // zlib compression level
     int                 vhost;                      // use virtual host style URL
     u_int               *nonzero_bitmap;            // is set to NULL by http_io_create()
+    int                 blockHashPrefix;
     int                 insecure;
     u_int               block_size;
     off_t               num_blocks;
@@ -81,6 +85,7 @@ struct http_io_conf {
     u_int               max_retry_pause;
     uintmax_t           max_speed[2];
     log_func_t          *log;
+    const char          *sse;
 };
 
 /* Statistics structure for http_io store */
@@ -134,5 +139,7 @@ struct http_io_stats {
 /* http_io.c */
 extern struct s3backer_store *http_io_create(struct http_io_conf *config);
 extern void http_io_get_stats(struct s3backer_store *s3b, struct http_io_stats *stats);
+extern void http_io_clear_stats(struct s3backer_store *s3b);
 extern int http_io_parse_block(struct http_io_conf *config, const char *name, s3b_block_t *block_num);
+extern void http_io_format_block_hash(const struct http_io_conf *config, char *block_hash_buf, size_t bufsiz, s3b_block_t block_num);
 

@@ -32,7 +32,7 @@
 # this exception statement from all source files in the program, then
 # also delete it here.
 
-AC_INIT([s3backer FUSE filesystem backed by Amazon S3], [1.4.3], [https://github.com/archiecobbs/s3backer], [s3backer])
+AC_INIT([s3backer FUSE filesystem backed by Amazon S3], [1.5.3], [https://github.com/archiecobbs/s3backer], [s3backer])
 AC_CONFIG_AUX_DIR(scripts)
 AM_INIT_AUTOMAKE(foreign)
 dnl AM_MAINTAINER_MODE
@@ -43,9 +43,10 @@ AC_PROG_MAKE_SET
 [CFLAGS="-g -O3 -pipe -Wall -Waggregate-return -Wcast-align -Wchar-subscripts -Wcomment -Wformat -Wimplicit -Wmissing-declarations -Wmissing-prototypes -Wnested-externs -Wno-long-long -Wparentheses -Wpointer-arith -Wredundant-decls -Wreturn-type -Wswitch -Wtrigraphs -Wuninitialized -Wunused -Wwrite-strings -Wshadow -Wstrict-prototypes -Wcast-qual $CFLAGS"]
 AC_SUBST(CFLAGS)
 
-# Compile flags for Linux
+# Compile flags for Linux. See https://stackoverflow.com/a/29201732
 AC_DEFINE(_GNU_SOURCE, 1, GNU functions)
 AC_DEFINE(_BSD_SOURCE, 1, BSD functions)
+AC_DEFINE(_DEFAULT_SOURCE, 1, Default functions)
 
 # Compile flags for Mac OS
 AC_DEFINE(_DARWIN_C_SOURCE, 1, MacOS functions)
@@ -78,8 +79,8 @@ AC_CHECK_LIB(z, compressBound,,
 	[AC_MSG_ERROR([required library zlib missing])])
 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
 #include <curl/curl.h>
-long x = CURLOPT_HTTP_CONTENT_DECODING;
-]])],, [AC_MSG_ERROR([unable to compile with curl, or curl version is < 7.16.2])])
+long x = CURLOPT_TCP_KEEPALIVE;
+]])],, [AC_MSG_ERROR([unable to compile with curl, or curl version is < 7.25.0])])
 
 # See if FUSE version is 2.9.2 or later
 AC_MSG_CHECKING([for fallocate() support in fuse])
@@ -123,6 +124,10 @@ AC_ARG_ENABLE(Werror,
     AC_HELP_STRING([--enable-Werror],
         [enable compilation with -Werror flag (default NO)]),
     [test x"$enableval" = "xyes" && CFLAGS="${CFLAGS} -Werror"])
+AC_ARG_ENABLE(sanitize,
+    AC_HELP_STRING([--enable-sanitize],
+        [enable compilation with -fsanitize=address and -fsanitize=undefined (default NO)]),
+    [test x"$enableval" = "xyes" && CFLAGS="${CFLAGS} -fsanitize=address -fsanitize=undefined"])
 
 # Generated files
 AC_CONFIG_FILES(Makefile)
